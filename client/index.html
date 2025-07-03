@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Real-Time Chat</title>
+  <style>
+    body { margin: 0; font-family: sans-serif; }
+    .container { display: flex; justify-content: center; align-items: center; height: 100vh; background-color: #f3f4f6; }
+    .form { background: white; padding: 1.5rem; border-radius: 0.5rem; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+    .form h1 { font-size: 1.5rem; margin-bottom: 1rem; }
+    .form input, .form select { width: 100%; padding: 0.5rem; margin-bottom: 1rem; border: 1px solid #ccc; }
+    .form button { width: 100%; padding: 0.5rem; background: #3b82f6; color: white; border: none; border-radius: 0.25rem; cursor: pointer; }
+    .chat-container { display: flex; flex-direction: column; height: 100vh; background-color: #f3f4f6; }
+    .header { background: #3b82f6; color: white; padding: 1rem; display: flex; justify-content: space-between; align-items: center; }
+    .header h1 { font-size: 1.25rem; }
+    .main { flex: 1; display: flex; flex-direction: column; }
+    .sidebar { width: 100%; background: white; padding: 1rem; border-right: 1px solid #ccc; }
+    .sidebar h2 { font-size: 1.125rem; margin-bottom: 0.5rem; }
+    .chat-area { flex: 1; overflow-y: auto; padding: 1rem; }
+    .message { margin-bottom: 0.5rem; }
+    .message.right { text-align: right; }
+    .message.left { text-align: left; }
+    .message div { display: inline-block; padding: 0.5rem; border-radius: 0.5rem; }
+    .message.right div { background: #bfdbfe; }
+    .message.left div { background: #e5e7eb; }
+    .message .timestamp { font-size: 0.75rem; color: #6b7280; }
+    .input-area { padding: 1rem; background: white; border-top: 1px solid #ccc; }
+    .input-area .flex { display: flex; gap: 0.5rem; }
+    .notifications { position: fixed; bottom: 1rem; right: 1rem; }
+    .notification { background: #fef9c3; padding: 0.5rem; border-radius: 0.25rem; margin-bottom: 0.5rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    @media (min-width: 768px) {
+      .main { flex-direction: row; }
+      .sidebar { width: 25%; }
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/socket.io-client@4.5.0/dist/socket.io.min.js"></script>
+  <script type="module">
+    const { useState, useEffect, useRef } = React;
+
+    const App = () => {
+      const [socket, setSocket] = useState(null);
+      const [username, setUsername] = useState('');
+      const [room, setRoom] = useState('general');
+      const [message, setMessage] = useState('');
+      const [messages, setMessages] = useState([]);
+      const [users, setUsers] = useState([]);
+      const [rooms, setRooms] = useState(['general']);
+      const [typingUsers, setTypingUsers] = useState([]);
+      const [notifications, setNotifications] = useState([]);
+      const [unreadCount, setUnreadCount] = useState(0);
+      const [isConnected, setIsConnected] = useState(false);
+      const [searchQuery, setSearchQuery] = useState('');
+      const [messageOffset, setMessageOffset] = useState(0);
+      const fileInputRef = useRef(null);
+      const messagesEndRef = useRef(null);
+
+      useEffect(() => {
+        const newSocket = io('http://localhost:5000', {
+          reconnection: true,
+          reconnectionAttempts: 5,
+          reconnectionDelay: 1000
+        });
+        setSocket(newSocket);
+
+        newSocket.on('connect', () => setIsConnected(true));
+        newSocket.on('disconnect', () => setIsConnected(false));
+
+        newSocket.on('receive_message', (msg) => {
+          setMessages((prev) => [...prev, msg]);
+          setUnreadCount((prev) => prev + 1);
+          if ('Notification' in window && Notification.permission === 'granted') {
+            new Notification(`New message from ${msg.sender}`, { body: msg.content });
+          }
+        });
+
+        newSocket.on('play_sound', () => {
+          new Audio('https://www.soundjay.com/buttons/beep-01a.mp3').play().catch(() => {});
+        });
+
+        newSocket.on('typing_users', (users) => setTypingUsers(users));
+        newSocket.on('user_list', (userList) => setUsers(userList));
+        newSocket.on('room_list', (roomList) => setRooms(roomList));
+
+        newSocket.on('notification', ({ message, id }) => {
+          setNotifications((prev) => [...prev, { id, message }]);
+          setTimeout(() => setNotifications((prev) => prev.filter(n => n.id !== id)), 5000);
+        });
+
+        newSocket.on('receive_messages', (msgs) => {
+          setMessages((prev) => [...msgs, ...prev.filter(m => !msgs.find(newMsg => newMsg.id === m.id))]);
+        });
+
+        newSocket.on('read_receipt', ({ messageId, readBy }) => {
+          setMessages((prev) => prev.map(m => m.id === messageId ? { ...m, readBy } : m));
+        });
+
+        newSocket.on('reaction', ({ messageId, username, reaction }) => {
+          setMessages((prev) => prev.map(m => m.id === messageId ? {
+            ...m,
+            reactions: new Map(m.reactions || new Map()).set(username, reaction)
+          } : m));
+        });
+
+        newSocket.on('search_results', (results) => setMessages(results));
+
+        newSocket.on('user_joined', ({ username }) => {
+          setNotifications((prev) => [...prev, { id: Date.now(), message: `${username} joined` }]);
+        });
+
+        newSocket.on('user_left', ({ username }) => {
+          setNotifications((prev) => [...prev, { id: Date.now(), message: `${username} left` }]);
+        });
+
+        return () => newSocket.disconnect();
+      }, []);
+
+      useEffect(() => {
+        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }, [messages]);
+
+      const handleJoin = () => {
+        if (username && socket) {
+          socket.emit('user_join', { username, room });
+          if ('Notification' in window) Notification.requestPermission();
+          setUnreadCount(0);
+        }
+      };
+
+      const sendMessage = () => {
+        if (message && socket) {
+          socket.emit('send_message', { content: message, room });
+          setMessage('');
+        }
+      };
+
+      const handleFileUpload = (e) => {
+        const file = e.target.files[0];
+        if (file && socket) {
+          const reader = new FileReader();
+          reader.onload = () => {
+            socket.emit('send_message', { content: message, room, file: reader.result });
+            setMessage('');
+          };
+          reader.readAsDataURL(file);
+        }
+      };
+
+      const handleTyping = (isTyping) => socket?.emit('typing', { room, isTyping });
+      const handleRead = (messageId) => socket?.emit('read_message', { messageId, room });
+      const handleReaction = (messageId, reaction) => socket?.emit('reaction', { messageId, room, reaction });
+      const joinRoom = (newRoom) => {
+        if (newRoom) {
+          setRoom(newRoom);
+          socket?.emit('join_room', { room: newRoom });
+          setMessages([]);
+          setMessageOffset(0);
+        }
+      };
+
+      const loadMoreMessages = () => {
+        setMessageOffset((prev) => prev + 20);
+        socket?.emit('load_more', { room, offset: messageOffset + 20 });
+      };
+
+      const searchMessages = () => socket?.emit('search_messages', { query: searchQuery, room });
+
+      if (!isConnected) {
+        return React.createElement(
+          'div',
+          { className: 'container' },
+          React.createElement(
+            'div',
+            { className: 'text-center' },
+            React.createElement('h1', { className: 'text-2xl mb-4' }, 'Connecting...'),
+            React.createElement('div', { className: 'animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500' })
+          )
+        );
+      }
+
+      if (!username) {
+        return React.createElement(
+          'div',
+          { className: 'container' },
+          React.createElement(
+            'div',
+            { className: 'form' },
+            React.createElement('h1', { className: 'text-2xl mb-4' }, 'Enter Username'),
+            React.createElement('input', {
+              type: 'text',
+              value: username,
+              onChange: (e) => setUsername(e.target.value),
+              className: 'border p-2 mb-4 w-full',
+              placeholder: 'Your username'
+            }),
+            React.createElement(
+              'select',
+              {
+                value: room,
+                onChange: (e) => setRoom(e.target.value),
+                className: 'border p-2 mb-4 w-full'
+              },
+              rooms.map((r) => React.createElement('option', { key: r, value: r }, r))
+            ),
+            React.createElement(
+              'button',
+              { onClick: handleJoin, className: 'bg-blue-500 text-white p-2 rounded w-full' },
+              'Join Chat'
+            )
+          )
+        );
+      }
+
+      return React.createElement(
+        'div',
+        { className: 'chat-container' },
+        React.createElement(
+          'div',
+          { className: 'header' },
+          React.createElement('h1', { className: 'text-xl' }, `Chat App - ${username} (${room})`),
+          React.createElement('span', { className: 'text-sm' }, `Unread: ${unreadCount}`)
+        ),
+        React.createElement(
+          'div',
+          { className: 'main md:flex-row' },
+          React.createElement(
+            'div',
+            { className: 'sidebar w-full md:w-1/4' },
+            React.createElement('h2', { className: 'text-lg mb-2' }, 'Users & Rooms'),
+            React.createElement(
+              'select',
+              {
+                value: room,
+                onChange: (e) => joinRoom(e.target.value),
+                className: 'border p-2 w-full mb-4'
+              },
+              rooms.map((r) => React.createElement('option', { key: r, value: r }, r)),
+              React.createElement('option', { value: '' }, 'New Room')
+            ),
+            React.createElement('input', {
+              type: 'text',
+              placeholder: 'New room name',
+              onKeyPress: (e) => e.key === 'Enter' && joinRoom(e.target.value),
+              className: 'border p-2 w-full mb-4'
+            }),
+            React.createElement(
+              'select',
+              {
+                onChange: (e) => e.target.value && socket?.emit('private_message', { toUsername: e.target.value, content: '' }),
+                className: 'border p-2 w-full mb-4'
+              },
+              React.createElement('option', { value: '' }, 'Send Private Message'),
+              users.map(([id, user]) => user.username !== username && (
+                React.createElement('option', { key: id, value: user.username }, `${user.username} ${user.online ? '(Online)' : '(Offline)'}`)
+              ))
+            ),
+            users.map(([id, user]) => (
+              React.createElement('div', { key: id, className: 'text-sm' }, `${user.username} ${user.online ? '(Online)' : '(Offline)'}`)
+            ))
+          ),
+          React.createElement(
+            'div',
+            { className: 'flex-1 flex flex-col' },
+            React.createElement(
+              'div',
+              { className: 'p-4' },
+              React.createElement('input', {
+                type: 'text',
+                value: searchQuery,
+                onChange: (e) => setSearchQuery(e.target.value),
+                onKeyPress: (e) => e.key === 'Enter' && searchMessages(),
+                className: 'border p-2 w-full mb-4',
+                placeholder: 'Search messages...'
+              }),
+              React.createElement(
+                'button',
+                { onClick: loadMoreMessages, className: 'bg-gray-200 p-2 rounded mb-4' },
+                'Load More'
+              )
+            ),
+            React.createElement(
+              'div',
+              { className: 'chat-area flex-1' },
+              messages.map((msg) => (
+                React.createElement(
+                  'div',
+                  {
+                    key: msg.id,
+                    className: `message ${msg.sender === username ? 'right' : 'left'}`,
+                    onClick: () => handleRead(msg.id)
+                  },
+                  React.createElement(
+                    'div',
+                    { className: `inline-block p-2 rounded-lg ${msg.sender === username ? 'bg-blue-100' : 'bg-gray-200'}` },
+                    React.createElement('strong', null, `${msg.sender}: `),
+                    msg.content,
+                    msg.file && (
+                      React.createElement(
+                        'div',
+                        null,
+                        React.createElement(
+                          'a',
+                          { href: msg.file, download: true },
+                          React.createElement('img', { src: msg.file, alt: 'Shared file', className: 'max-w-xs mt-2' })
+                        )
+                      )
+                    ),
+                    React.createElement(
+                      'div',
+                      { className: 'timestamp' },
+                      new Date(msg.timestamp).toLocaleTimeString(),
+                      msg.readBy?.size > 1 && ` (Read by ${msg.readBy.size - 1})`
+                    ),
+                    React.createElement(
+                      'div',
+                      { className: 'flex gap-2 mt-1' },
+                      ['👍', '❤️', '😂'].map((r) => (
+                        React.createElement(
+                          'button',
+                          {
+                            key: r,
+                            onClick: () => handleReaction(msg.id, r),
+                            className: 'text-sm'
+                          },
+                          r,
+                          msg.reactions?.get(username) === r ? ' ✓' : ''
+                        )
+                      ))
+                    )
+                  )
+                )
+              )),
+              typingUsers.length > 0 && (
+                React.createElement('div', { className: 'text-gray-500 italic' }, `${typingUsers.join(', ')} typing...`)
+              ),
+              React.createElement('div', { ref: messagesEndRef })
+            ),
+            React.createElement(
+              'div',
+              { className: 'input-area' },
+              React.createElement(
+                'div',
+                { className: 'flex' },
+                React.createElement('input', {
+                  type: 'text',
+                  value: message,
+                  onChange: (e) => {
+                    setMessage(e.target.value);
+                    handleTyping(true);
+                  },
+                  onBlur: () => handleTyping(false),
+                  onKeyPress: (e) => e.key === 'Enter' && sendMessage(),
+                  className: 'flex-1 border p-2 rounded',
+                  placeholder: 'Type a message...'
+                }),
+                React.createElement('input', {
+                  type: 'file',
+                  ref: fileInputRef,
+                  onChange: handleFileUpload,
+                  className: 'hidden'
+                }),
+                React.createElement(
+                  'button',
+                  { onClick: () => fileInputRef.current.click(), className: 'bg-gray-500 text-white p-2 rounded' },
+                  '📎'
+                ),
+                React.createElement(
+                  'button',
+                  { onClick: sendMessage, className: 'bg-blue-500 text-white p-2 rounded' },
+                  'Send'
+                )
+              )
+            )
+          )
+        ),
+        React.createElement(
+          'div',
+          { className: 'notifications' },
+          notifications.map((n) => (
+            React.createElement('div', { key: n.id, className: 'notification' }, n.message)
+          ))
+        )
+      );
+    };
+
+    ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+  </script>
+</body>
+</html>

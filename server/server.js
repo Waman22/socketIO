@@ -1,14 +1,10 @@
-// server.js - Main server file for Socket.io chat application
-
+// Load environment variables
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const dotenv = require('dotenv');
 const path = require('path');
-
-// Load environment variables
-dotenv.config();
 
 // Initialize Express app
 const app = express();
@@ -17,8 +13,9 @@ const io = new Server(server, {
   cors: {
     origin: process.env.CLIENT_URL || 'http://localhost:5173',
     methods: ['GET', 'POST'],
-    credentials: true,
+    credentials: true
   },
+  maxHttpBufferSize: 1e7 // 10MB for file sharing (Task 3)
 });
 
 // Middleware
@@ -26,96 +23,186 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Store connected users and messages
-const users = {};
-const messages = [];
-const typingUsers = {};
+// Data structures
+const users = new Map(); // { socketId: { username, rooms: Set, online: boolean } }
+const messages = new Map(); // { room: [{ id, sender, senderId, content, timestamp, file, readBy: Set, reactions: Map }] }
+const rooms = new Set(['general']); // Available rooms
+const typingUsers = new Map(); // { room: Set<username> }
 
 // Socket.io connection handler
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
 
-  // Handle user joining
-  socket.on('user_join', (username) => {
-    users[socket.id] = { username, id: socket.id };
-    io.emit('user_list', Object.values(users));
-    io.emit('user_joined', { username, id: socket.id });
-    console.log(`${username} joined the chat`);
+  // Task 2: User authentication (username-based) and join room
+  socket.on('user_join', ({ username, room = 'general' }) => {
+    if (!users.has(socket.id)) {
+      users.set(socket.id, { username, rooms: new Set([room]), online: true });
+      socket.join(room);
+      if (!messages.has(room)) messages.set(room, []);
+      if (!rooms.has(room)) rooms.add(room);
+
+      // Send initial messages for the room
+      socket.emit('receive_messages', messages.get(room));
+      // Update user list and rooms
+      io.emit('user_list', Array.from(users.entries()));
+      io.emit('room_list', Array.from(rooms));
+      // Task 4: Notify room of user joining
+      io.to(room).emit('notification', { message: `${username} joined ${room}`, id: Date.now() });
+      console.log(`${username} joined ${room}`);
+    }
   });
 
-  // Handle chat messages
-  socket.on('send_message', (messageData) => {
+  // Task 2 & 3: Handle global and private messages
+  socket.on('send_message', ({ content, room = 'general', file }) => {
     const message = {
-      ...messageData,
       id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
+      sender: users.get(socket.id)?.username || 'Anonymous',
       senderId: socket.id,
+      content,
       timestamp: new Date().toISOString(),
+      file: file || null,
+      readBy: new Set([socket.id]), // Task 3: Read receipts
+      reactions: new Map() // Task 3: Message reactions
     };
-    
-    messages.push(message);
-    
-    // Limit stored messages to prevent memory issues
-    if (messages.length > 100) {
-      messages.shift();
+
+    if (!messages.has(room)) messages.set(room, []);
+    messages.get(room).push(message);
+
+    // Task 5: Limit messages for performance (pagination support)
+    if (messages.get(room).length > 200) messages.get(room).shift();
+
+    // Broadcast message to room or specific user
+    if (room.startsWith('private_')) {
+      const recipientId = room.split('_')[1];
+      socket.to(recipientId).emit('receive_message', message);
+      socket.emit('receive_message', message); // Echo to sender
+    } else {
+      io.to(room).emit('receive_message', message);
     }
-    
-    io.emit('receive_message', message);
+
+    // Task 5: Delivery acknowledgment
+    socket.emit('ack', { id: message.id });
+
+    // Task 4: New message notification
+    socket.to(room).emit('notification', {
+      message: `${message.sender}: ${message.content.slice(0, 20)}${message.content.length > 20 ? '...' : ''}`,
+      id: Date.now()
+    });
+
+    // Task 4: Sound notification
+    socket.to(room).emit('play_sound');
   });
 
-  // Handle typing indicator
-  socket.on('typing', (isTyping) => {
-    if (users[socket.id]) {
-      const username = users[socket.id].username;
-      
+  // Task 2 & 3: Typing indicator
+  socket.on('typing', ({ room = 'general', isTyping }) => {
+    if (users.get(socket.id)) {
+      const username = users.get(socket.id).username;
+      if (!typingUsers.has(room)) typingUsers.set(room, new Set());
+
       if (isTyping) {
-        typingUsers[socket.id] = username;
+        typingUsers.get(room).add(username);
       } else {
-        delete typingUsers[socket.id];
+        typingUsers.get(room).delete(username);
       }
-      
-      io.emit('typing_users', Object.values(typingUsers));
+
+      io.to(room).emit('typing_users', Array.from(typingUsers.get(room) || []));
     }
   });
 
-  // Handle private messages
-  socket.on('private_message', ({ to, message }) => {
-    const messageData = {
-      id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
-      senderId: socket.id,
-      message,
-      timestamp: new Date().toISOString(),
-      isPrivate: true,
-    };
-    
-    socket.to(to).emit('private_message', messageData);
-    socket.emit('private_message', messageData);
+  // Task 3: Private messaging
+  socket.on('private_message', ({ toUsername, content, file }) => {
+    const recipient = Array.from(users.entries()).find(
+      ([, user]) => user.username === toUsername
+    );
+    if (recipient) {
+      const room = `private_${recipient[0]}`;
+      socket.emit('send_message', { content, room, file });
+    }
   });
 
-  // Handle disconnection
+  // Task 3: Join new room
+  socket.on('join_room', ({ room }) => {
+    if (!rooms.has(room)) rooms.add(room);
+    users.get(socket.id)?.rooms.add(room);
+    socket.join(room);
+    if (!messages.has(room)) messages.set(room, []);
+    socket.emit('receive_messages', messages.get(room));
+    io.emit('room_list', Array.from(rooms));
+    io.to(room).emit('notification', {
+      message: `${users.get(socket.id)?.username} joined ${room}`,
+      id: Date.now()
+    });
+  });
+
+  // Task 3: Read receipts
+  socket.on('read_message', ({ messageId, room }) => {
+    const msg = messages.get(room)?.find(m => m.id === messageId);
+    if (msg) {
+      msg.readBy.add(socket.id);
+      io.to(room).emit('read_receipt', { messageId, readBy: Array.from(msg.readBy) });
+    }
+  });
+
+  // Task 3: Message reactions
+  socket.on('reaction', ({ messageId, room, reaction }) => {
+    const msg = messages.get(room)?.find(m => m.id === messageId);
+    if (msg) {
+      msg.reactions.set(users.get(socket.id).username, reaction);
+      io.to(room).emit('reaction', { messageId, username: users.get(socket.id).username, reaction });
+    }
+  });
+
+  // Task 5: Message search
+  socket.on('search_messages', ({ query, room }) => {
+    const results = messages.get(room)?.filter(m =>
+      m.content.toLowerCase().includes(query.toLowerCase())
+    ) || [];
+    socket.emit('search_results', results);
+  });
+
+  // Task 5: Message pagination
+  socket.on('load_more', ({ room, offset }) => {
+    const roomMessages = messages.get(room) || [];
+    const pageSize = 20;
+    const paginated = roomMessages.slice(
+      Math.max(roomMessages.length - offset - pageSize, 0),
+      roomMessages.length - offset
+    );
+    socket.emit('receive_messages', paginated);
+  });
+
+  // Task 2 & 4: Handle disconnection
   socket.on('disconnect', () => {
-    if (users[socket.id]) {
-      const { username } = users[socket.id];
-      io.emit('user_left', { username, id: socket.id });
-      console.log(`${username} left the chat`);
+    const user = users.get(socket.id);
+    if (user) {
+      user.rooms.forEach(room => {
+        io.to(room).emit('notification', {
+          message: `${user.username} left ${room}`,
+          id: Date.now()
+        });
+        io.to(room).emit('user_left', { username: user.username, id: socket.id });
+      });
+      users.delete(socket.id);
+      rooms.forEach(room => typingUsers.get(room)?.delete(user.username));
+      io.emit('user_list', Array.from(users.entries()));
+      io.emit('typing_users', Array.from(typingUsers.get('general') || []));
+      console.log(`${user.username} disconnected`);
     }
-    
-    delete users[socket.id];
-    delete typingUsers[socket.id];
-    
-    io.emit('user_list', Object.values(users));
-    io.emit('typing_users', Object.values(typingUsers));
   });
 });
 
-// API routes
+// API routes for message and user history
 app.get('/api/messages', (req, res) => {
-  res.json(messages);
+  const room = req.query.room || 'general';
+  res.json(messages.get(room) || []);
 });
 
 app.get('/api/users', (req, res) => {
-  res.json(Object.values(users));
+  res.json(Array.from(users.entries()));
+});
+
+app.get('/api/rooms', (req, res) => {
+  res.json(Array.from(rooms));
 });
 
 // Root route
@@ -129,4 +216,4 @@ server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
 
-module.exports = { app, server, io }; 
+module.exports = { app, server, io };

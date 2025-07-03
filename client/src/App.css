@@ -1,0 +1,12 @@
+/* Tailwind-like responsive styles */
+@media (max-width: 768px) {
+  .flex-col.md\\:flex-row {
+    flex-direction: column;
+  }
+  .w-full.md\\:w-1\\/4 {
+    width: 100%;
+  }
+  .text-xl {
+    font-size: 1.25rem;
+  }
+}

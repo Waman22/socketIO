@@ -4,6 +4,7 @@
 This assignment focuses on building a real-time chat application using Socket.io, implementing bidirectional communication between clients and server.
 
 backend deployement : https://backend-2w7a.onrender.com
+frontend deployment https://wamifrontenend.netlify.app/
 
 ## Assignment Overview
 
